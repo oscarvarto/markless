@@ -34,6 +34,23 @@ const fn image_mode_to_protocol_type(mode: ImageMode) -> ProtocolType {
     }
 }
 
+/// Query stdio for font size, then override the protocol type.
+///
+/// The stdio query gives us accurate font/cell dimensions for image scaling,
+/// while we override the detected protocol with one we trust more (from env
+/// vars or CLI flags).
+#[cfg(unix)]
+fn picker_with_protocol(protocol_type: ProtocolType, reason: &str) -> Picker {
+    let mut picker = Picker::from_query_stdio_with_options(query_options())
+        .unwrap_or_else(|_| Picker::halfblocks());
+    picker.set_protocol_type(protocol_type);
+    crate::perf::log_event(
+        "image.create_picker",
+        format!("{reason} protocol={protocol_type:?}"),
+    );
+    picker
+}
+
 /// Create a picker for terminal image rendering.
 ///
 /// When `image_mode` is `Some`, the picker is forced to use that protocol.
@@ -52,14 +69,7 @@ pub fn create_picker(image_mode: Option<ImageMode>) -> Option<Picker> {
         // protocol type to the one the user requested.
         #[cfg(unix)]
         {
-            let mut picker = Picker::from_query_stdio_with_options(query_options())
-                .unwrap_or_else(|_| Picker::halfblocks());
-            picker.set_protocol_type(protocol_type);
-            crate::perf::log_event(
-                "image.create_picker",
-                format!("forced protocol={protocol_type:?} (queried font size)"),
-            );
-            return Some(picker);
+            return Some(picker_with_protocol(protocol_type, "forced"));
         }
 
         #[cfg(not(unix))]
@@ -86,14 +96,22 @@ pub fn create_picker(image_mode: Option<ImageMode>) -> Option<Picker> {
         return Some(Picker::halfblocks());
     }
 
-    // Try to create a picker, which will detect the terminal's capabilities
+    // Trust environment variables first (TERM_PROGRAM, KITTY_WINDOW_ID, etc.)
+    // since they are set by the terminal and are reliable. Only fall back to
+    // the stdio capability query for unknown terminals.
     #[cfg(unix)]
     {
+        let env_detected = detect_protocol();
+        if env_detected != ImageMode::Halfblock {
+            let protocol_type = image_mode_to_protocol_type(env_detected);
+            return Some(picker_with_protocol(protocol_type, "env"));
+        }
+
         let picker = Picker::from_query_stdio_with_options(query_options()).ok()?;
         crate::perf::log_event(
             "image.create_picker",
             format!(
-                "term_program={} term={} colorterm={} protocol={:?}",
+                "stdio term_program={} term={} colorterm={} protocol={:?}",
                 std::env::var("TERM_PROGRAM").unwrap_or_else(|_| "<unset>".to_string()),
                 std::env::var("TERM").unwrap_or_else(|_| "<unset>".to_string()),
                 std::env::var("COLORTERM").unwrap_or_else(|_| "<unset>".to_string()),

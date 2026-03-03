@@ -50,6 +50,10 @@ pub struct ConfigFlags {
     /// External editor command (e.g. "hx", "vim", "emacsclient -t").
     /// `Some("")` means explicitly cleared via `--no-editor`.
     pub editor: Option<String>,
+    /// Disable inline (Unicode) math, rendering as images instead.
+    pub no_inline_math: bool,
+    /// Re-enable inline math (overrides saved `--no-inline-math`).
+    pub inline_math: bool,
 }
 
 impl ConfigFlags {
@@ -70,6 +74,8 @@ impl ConfigFlags {
                 .or_else(|| self.render_debug_log.clone()),
             wrap_width: other.wrap_width.or(self.wrap_width),
             editor: other.editor.clone().or_else(|| self.editor.clone()),
+            no_inline_math: self.no_inline_math || other.no_inline_math,
+            inline_math: self.inline_math || other.inline_math,
         }
     }
 }
@@ -213,6 +219,9 @@ pub fn save_config_flags(path: &Path, flags: &ConfigFlags) -> Result<()> {
     if let Some(width) = flags.wrap_width {
         lines.push(format!("--wrap-width {width}"));
     }
+    if flags.no_inline_math && !flags.inline_math {
+        lines.push("--no-inline-math".to_string());
+    }
     if let Some(ref editor) = flags.editor {
         if editor.is_empty() {
             lines.push("--no-editor".to_string());
@@ -296,6 +305,10 @@ pub fn parse_flag_tokens(tokens: &[String]) -> ConfigFlags {
             flags.editor = Some(value.to_string());
         } else if token == "--no-editor" {
             flags.editor = Some(String::new());
+        } else if token == "--no-inline-math" {
+            flags.no_inline_math = true;
+        } else if token == "--inline-math" {
+            flags.inline_math = true;
         }
         i += 1;
     }
@@ -737,5 +750,67 @@ mod tests {
         let tokens = shell_split_tokens("   ");
         assert!(tokens.is_empty());
         assert!(tokens.first().is_none());
+    }
+
+    #[test]
+    fn test_parse_flag_tokens_no_inline_math() {
+        let args = vec!["--no-inline-math".to_string()];
+        let flags = parse_flag_tokens(&args);
+        assert!(flags.no_inline_math);
+    }
+
+    #[test]
+    fn test_config_union_no_inline_math() {
+        let file = ConfigFlags::default();
+        let cli = ConfigFlags {
+            no_inline_math: true,
+            ..ConfigFlags::default()
+        };
+        let merged = file.union(&cli);
+        assert!(merged.no_inline_math);
+    }
+
+    #[test]
+    fn test_save_load_no_inline_math() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(".marklessrc");
+        let flags = ConfigFlags {
+            no_inline_math: true,
+            ..ConfigFlags::default()
+        };
+        save_config_flags(&path, &flags).unwrap();
+        let loaded = load_config_flags(&path).unwrap();
+        assert!(loaded.no_inline_math);
+    }
+
+    #[test]
+    fn test_parse_flag_tokens_inline_math() {
+        let args = vec!["--inline-math".to_string()];
+        let flags = parse_flag_tokens(&args);
+        assert!(flags.inline_math);
+    }
+
+    #[test]
+    fn test_inline_math_overrides_no_inline_math_in_save() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(".marklessrc");
+        // Save --no-inline-math first
+        let flags = ConfigFlags {
+            no_inline_math: true,
+            ..ConfigFlags::default()
+        };
+        save_config_flags(&path, &flags).unwrap();
+        // Now save with --inline-math override
+        let override_flags = ConfigFlags {
+            no_inline_math: true,
+            inline_math: true,
+            ..ConfigFlags::default()
+        };
+        save_config_flags(&path, &override_flags).unwrap();
+        let loaded = load_config_flags(&path).unwrap();
+        assert!(
+            !loaded.no_inline_math,
+            "--inline-math should prevent --no-inline-math from being saved"
+        );
     }
 }

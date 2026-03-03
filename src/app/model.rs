@@ -160,6 +160,10 @@ pub struct Model {
     pub needs_full_redraw: bool,
     /// Mermaid source texts that failed to render; these fall back to code blocks.
     pub failed_mermaid_srcs: HashSet<String>,
+    /// Math source texts that failed to render; these fall back to text blocks.
+    pub failed_math_srcs: HashSet<String>,
+    /// Disable inline (Unicode) math, rendering as images instead.
+    pub no_inline_math: bool,
 }
 
 impl std::fmt::Debug for Model {
@@ -234,6 +238,8 @@ impl Model {
             external_editor: None,
             needs_full_redraw: false,
             failed_mermaid_srcs: HashSet::new(),
+            failed_math_srcs: HashSet::new(),
+            no_inline_math: false,
         }
     }
 
@@ -248,7 +254,7 @@ impl Model {
     ///
     /// True only when images are enabled and the terminal supports a real
     /// graphics protocol (Kitty, Sixel, iTerm2) — not half-block fallback.
-    pub fn should_render_mermaid_as_images(&self) -> bool {
+    fn has_real_image_protocol(&self) -> bool {
         if !self.images_enabled {
             return false;
         }
@@ -256,6 +262,16 @@ impl Model {
             return false;
         };
         !matches!(picker.protocol_type(), ProtocolType::Halfblocks)
+    }
+
+    /// Whether mermaid diagrams should be rendered as images.
+    pub fn should_render_mermaid_as_images(&self) -> bool {
+        self.has_real_image_protocol()
+    }
+
+    /// Whether math blocks should be rendered as images.
+    pub fn should_render_math_as_images(&self) -> bool {
+        self.has_real_image_protocol()
     }
 
     /// Load images that are near the viewport (lazy loading with lookahead).
@@ -318,6 +334,7 @@ impl Model {
 
         let loader = ImageLoader::new(self.base_dir.clone());
         let mut mermaid_failed = false;
+        let mut math_failed = false;
 
         for src in images_to_process {
             // Check if we need to load/reload this image's protocol
@@ -353,6 +370,28 @@ impl Model {
                         } else {
                             None
                         }
+                    } else if src.starts_with("math://") {
+                        let math_text = self.document.math_sources().get(&src).cloned();
+                        if let Some(math_text) = math_text {
+                            match crate::math::render_to_image(&math_text, target_width_px) {
+                                Ok(img) => {
+                                    self.original_images.insert(src.clone(), img.clone());
+                                    Some(img)
+                                }
+                                Err(e) => {
+                                    crate::perf::log_event(
+                                        "math.render.error",
+                                        format!("src={src} err={e}"),
+                                    );
+                                    if self.failed_math_srcs.insert(math_text) {
+                                        math_failed = true;
+                                    }
+                                    None
+                                }
+                            }
+                        } else {
+                            None
+                        }
                     } else if let Some(img) = loader.load_sync(&src) {
                         self.original_images.insert(src.clone(), img.clone());
                         Some(img)
@@ -362,13 +401,20 @@ impl Model {
 
                 if let Some(img) = original {
                     // Scale to fit target width, preserving aspect ratio.
-                    let scale = f64::from(target_width_px) / f64::from(img.width());
+                    // For math images, don't upscale — they're already rendered
+                    // at the right size for their content.
+                    let effective_width = if src.starts_with("math://") {
+                        img.width().min(target_width_px)
+                    } else {
+                        target_width_px
+                    };
+                    let scale = f64::from(effective_width) / f64::from(img.width());
                     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                     // Scaled image height is always positive and well within u32 range.
                     let scaled_height_px = (f64::from(img.height()) * scale) as u32;
 
                     let mut scaled = img.resize(
-                        target_width_px,
+                        effective_width,
                         scaled_height_px,
                         if use_halfblocks {
                             image::imageops::FilterType::CatmullRom
@@ -381,8 +427,17 @@ impl Model {
                     }
 
                     let protocol = picker.new_resize_protocol(scaled);
-                    let (width_cols, height_rows) =
-                        protocol_render_size(&protocol, target_width_cols);
+                    // For math, use the image's natural column width so the
+                    // protocol doesn't stretch a small equation to fill the
+                    // full viewport width.
+                    #[allow(clippy::cast_possible_truncation)]
+                    let render_cols = if src.starts_with("math://") {
+                        let cols = effective_width / u32::from(font_size.0);
+                        (cols.max(1) as u16).min(target_width_cols)
+                    } else {
+                        target_width_cols
+                    };
+                    let (width_cols, height_rows) = protocol_render_size(&protocol, render_cols);
                     self.image_protocols
                         .insert(src.clone(), (protocol, width_cols, height_rows));
                     crate::perf::log_event(
@@ -398,6 +453,9 @@ impl Model {
         if mermaid_failed {
             self.show_toast(ToastLevel::Warning, "Mermaid render failed, showing source");
         }
+        if math_failed {
+            self.show_toast(ToastLevel::Warning, "Math render failed, showing text");
+        }
 
         let current_layout_heights: HashMap<String, usize> = self
             .image_protocols
@@ -405,7 +463,7 @@ impl Model {
             .map(|(src, (_, _, height_rows))| (src.clone(), *height_rows as usize))
             .collect();
 
-        if mermaid_failed || current_layout_heights != self.image_layout_heights {
+        if mermaid_failed || math_failed || current_layout_heights != self.image_layout_heights {
             if current_layout_heights != self.image_layout_heights {
                 crate::perf::log_event(
                     "image.layout.reflow",
@@ -518,12 +576,18 @@ impl Model {
     fn reparse_document(&mut self) {
         let width = self.layout_width();
         let mermaid = self.should_render_mermaid_as_images();
+        let math = self.should_render_math_as_images();
         if let Ok(document) = Document::parse_with_all_options_and_failures(
             self.document.source(),
             width,
             &self.image_layout_heights,
-            mermaid,
-            &self.failed_mermaid_srcs,
+            &crate::document::DiagramRenderOpts {
+                mermaid_as_images: mermaid,
+                failed_mermaid_srcs: &self.failed_mermaid_srcs,
+                math_as_images: math,
+                failed_math_srcs: &self.failed_math_srcs,
+                no_inline_math: self.no_inline_math,
+            },
         ) {
             self.document = document;
             self.viewport.set_total_lines(self.document.line_count());
@@ -610,8 +674,13 @@ impl Model {
                 &content,
                 self.layout_width(),
                 &self.image_layout_heights,
-                self.should_render_mermaid_as_images(),
-                &self.failed_mermaid_srcs,
+                &crate::document::DiagramRenderOpts {
+                    mermaid_as_images: self.should_render_mermaid_as_images(),
+                    failed_mermaid_srcs: &self.failed_mermaid_srcs,
+                    math_as_images: self.should_render_math_as_images(),
+                    failed_math_srcs: &self.failed_math_srcs,
+                    no_inline_math: self.no_inline_math,
+                },
             )
         } else {
             Ok(Document::from_plain_text(&content))
@@ -741,14 +810,17 @@ impl Model {
 
     pub(super) fn reload_from_disk(&mut self) -> Result<()> {
         let old_mermaid_sources = self.document.mermaid_sources().clone();
+        let old_math_sources = self.document.math_sources().clone();
         let raw_bytes = std::fs::read(&self.file_path)?;
         let path = self.file_path.clone();
         let document = self.document_from_bytes(&path, raw_bytes)?;
         self.document = document;
 
-        // Invalidate cached mermaid images whose source text changed.
+        // Invalidate cached mermaid/math images whose source text changed.
         let new_mermaid_sources = self.document.mermaid_sources().clone();
         self.invalidate_changed_mermaid_caches(&old_mermaid_sources, &new_mermaid_sources);
+        let new_math_sources = self.document.math_sources().clone();
+        self.invalidate_changed_mermaid_caches(&old_math_sources, &new_math_sources);
 
         // Drop cached image entries that are no longer present in the document.
         let valid_images: std::collections::HashSet<_> = self
@@ -956,6 +1028,8 @@ impl Default for Model {
             external_editor: None,
             needs_full_redraw: false,
             failed_mermaid_srcs: HashSet::new(),
+            failed_math_srcs: HashSet::new(),
+            no_inline_math: false,
         }
     }
 }

@@ -13,6 +13,35 @@ use super::types::{
     ParsedDocument, RenderedLine,
 };
 
+/// Options controlling how diagrams and math expressions are rendered.
+pub struct DiagramRenderOpts<'a> {
+    /// Render mermaid code blocks as image placeholders.
+    pub mermaid_as_images: bool,
+    /// Mermaid sources that failed to render (fall back to code blocks).
+    pub failed_mermaid_srcs: &'a HashSet<String>,
+    /// Render display math as image placeholders.
+    pub math_as_images: bool,
+    /// Math sources that failed to render (fall back to text blocks).
+    pub failed_math_srcs: &'a HashSet<String>,
+    /// Disable inline (Unicode) math, rendering as images instead.
+    pub no_inline_math: bool,
+}
+
+impl Default for DiagramRenderOpts<'_> {
+    fn default() -> Self {
+        Self {
+            mermaid_as_images: false,
+            failed_mermaid_srcs: &EMPTY_HASH_SET,
+            math_as_images: false,
+            failed_math_srcs: &EMPTY_HASH_SET,
+            no_inline_math: false,
+        }
+    }
+}
+
+static EMPTY_HASH_SET: std::sync::LazyLock<HashSet<String>> =
+    std::sync::LazyLock::new(HashSet::new);
+
 /// Parse markdown source into a Document.
 ///
 /// # Example
@@ -55,18 +84,21 @@ impl Document {
         parse_with_layout(source, width, image_heights)
     }
 
-    /// Parse markdown, rendering mermaid code blocks as image placeholders.
+    /// Parse markdown, rendering mermaid/math code blocks as image placeholders.
     ///
     /// # Errors
     /// Returns an error if markdown parsing fails.
     pub fn parse_with_mermaid_images(source: &str, width: u16) -> Result<Self> {
-        Ok(parse_with_all_options(
+        Self::parse_with_all_options_and_failures(
             source,
             width,
             &HashMap::new(),
-            true,
-            &HashSet::new(),
-        ))
+            &DiagramRenderOpts {
+                mermaid_as_images: true,
+                math_as_images: true,
+                ..DiagramRenderOpts::default()
+            },
+        )
     }
 
     /// Parse with all options: layout width, image heights, and mermaid-as-images flag.
@@ -83,15 +115,18 @@ impl Document {
             source,
             width,
             image_heights,
-            mermaid_as_images,
-            &HashSet::new(),
+            &DiagramRenderOpts {
+                mermaid_as_images,
+                math_as_images: mermaid_as_images, // mirrors mermaid
+                ..DiagramRenderOpts::default()
+            },
         )
     }
 
-    /// Parse with all options plus a set of mermaid sources that failed to render.
+    /// Parse with all options plus sets of sources that failed to render.
     ///
-    /// Sources in `failed_mermaid_srcs` will be rendered as code blocks even
-    /// when `mermaid_as_images` is true.
+    /// Sources in `failed_mermaid_srcs` / `failed_math_srcs` will be rendered
+    /// as code/text blocks even when the as-images flag is true.
     ///
     /// # Errors
     /// Returns an error if markdown parsing fails.
@@ -99,15 +134,13 @@ impl Document {
         source: &str,
         width: u16,
         image_heights: &HashMap<String, usize>,
-        mermaid_as_images: bool,
-        failed_mermaid_srcs: &HashSet<String>,
+        diagram_opts: &DiagramRenderOpts<'_>,
     ) -> Result<Self> {
         Ok(parse_with_all_options(
             source,
             width,
             image_heights,
-            mermaid_as_images,
-            failed_mermaid_srcs,
+            diagram_opts,
         ))
     }
 }
@@ -140,22 +173,30 @@ pub fn parse_with_layout<S: BuildHasher>(
     width: u16,
     image_heights: &HashMap<String, usize, S>,
 ) -> Result<Document> {
-    Ok(parse_with_all_options(
+    Ok(parse_with_all_options_internal(
         source,
         width,
         image_heights,
-        false,
-        &HashSet::new(),
+        &DiagramRenderOpts::default(),
     ))
 }
 
-/// Parse markdown with all options including mermaid-as-images flag.
-fn parse_with_all_options<S: BuildHasher>(
+/// Parse markdown with all options including mermaid/math-as-images flags.
+fn parse_with_all_options(
+    source: &str,
+    width: u16,
+    image_heights: &HashMap<String, usize>,
+    opts: &DiagramRenderOpts<'_>,
+) -> Document {
+    parse_with_all_options_internal(source, width, image_heights, opts)
+}
+
+/// Internal parse implementation that accepts any `BuildHasher` for image heights.
+fn parse_with_all_options_internal<S: BuildHasher>(
     source: &str,
     width: u16,
     image_heights: &HashMap<String, usize, S>,
-    mermaid_as_images: bool,
-    failed_mermaid_srcs: &HashSet<String>,
+    opts: &DiagramRenderOpts<'_>,
 ) -> Document {
     let arena = Arena::new();
     let options = create_options();
@@ -170,10 +211,14 @@ fn parse_with_all_options<S: BuildHasher>(
         footnotes: HashMap::new(),
         code_blocks: Vec::new(),
         mermaid_sources: HashMap::new(),
+        math_sources: HashMap::new(),
         image_heights,
         wrap_width,
-        mermaid_as_images,
-        failed_mermaid_srcs,
+        mermaid_as_images: opts.mermaid_as_images,
+        failed_mermaid_srcs: opts.failed_mermaid_srcs,
+        math_as_images: opts.math_as_images,
+        failed_math_srcs: opts.failed_math_srcs,
+        no_inline_math: opts.no_inline_math,
     };
     process_node(root, &mut ctx, 0, None);
 
@@ -187,6 +232,7 @@ fn parse_with_all_options<S: BuildHasher>(
             footnotes: ctx.footnotes,
             code_blocks: ctx.code_blocks,
             mermaid_sources: ctx.mermaid_sources,
+            math_sources: ctx.math_sources,
         },
     )
 }
@@ -207,6 +253,10 @@ fn create_options() -> Options {
     options.extension.header_ids = Some(String::new());
     options.extension.description_lists = true;
 
+    // Enable LaTeX math ($...$, $$...$$, and $`...`$)
+    options.extension.math_dollars = true;
+    options.extension.math_code = true;
+
     options
 }
 
@@ -219,10 +269,14 @@ struct ParseContext<'h, S: BuildHasher = std::collections::hash_map::RandomState
     footnotes: HashMap<String, usize>,
     code_blocks: Vec<CodeBlockRef>,
     mermaid_sources: HashMap<String, String>,
+    math_sources: HashMap<String, String>,
     image_heights: &'h HashMap<String, usize, S>,
     wrap_width: usize,
     mermaid_as_images: bool,
     failed_mermaid_srcs: &'h HashSet<String>,
+    math_as_images: bool,
+    failed_math_srcs: &'h HashSet<String>,
+    no_inline_math: bool,
 }
 
 fn process_node<'a, S: BuildHasher>(
@@ -264,35 +318,75 @@ fn process_node<'a, S: BuildHasher>(
         }
 
         NodeValue::Paragraph => {
+            // Check if paragraph ends with display math ($$...$$).
+            // This handles both standalone display math and paragraphs where
+            // text precedes the $$ block (e.g. after a hard line break `\`).
+            if let Some(literal) = extract_display_math_literal(node) {
+                // If the paragraph has leading text before the math,
+                // render that text first as a regular paragraph.
+                if let Some(spans) = collect_spans_before_display_math(node) {
+                    let wrapped = wrap_spans(&spans, ctx.wrap_width, "", "");
+                    for line_spans in wrapped {
+                        let content = spans_to_string(&line_spans);
+                        ctx.lines.push(RenderedLine::with_spans(
+                            content,
+                            LineType::Paragraph,
+                            line_spans,
+                        ));
+                    }
+                }
+
+                let source_failed = ctx.failed_math_srcs.contains(&literal);
+                if ctx.math_as_images && !source_failed {
+                    emit_math_image_placeholder(&literal, ctx);
+                } else {
+                    emit_math_text_block(&literal, ctx);
+                }
+                // Store in math_sources even for text fallback
+                if !ctx.math_sources.values().any(|v| v == literal.trim_end()) {
+                    let key = format!("math://{}", ctx.math_sources.len());
+                    ctx.math_sources.insert(key, literal.trim_end().to_string());
+                }
+                ctx.lines
+                    .push(RenderedLine::new(String::new(), LineType::Empty));
+                return;
+            }
+
             // Check if paragraph contains only an image (common case)
             let child_images = collect_paragraph_images(node);
 
             if child_images.is_empty() {
-                // Regular paragraph text with inline styling and wrapping
-                let spans = collect_inline_spans(node);
-                // Collect links with a placeholder line number (will be fixed up after wrapping)
-                let link_start = ctx.link_refs.len();
-                collect_inline_elements(node, 0, &mut ctx.images, &mut ctx.link_refs);
+                // When no_inline_math is enabled, split paragraph at
+                // inline math boundaries so each $...$ gets its own image.
+                if ctx.no_inline_math && ctx.math_as_images && has_inline_math(node) {
+                    emit_paragraph_with_no_inline_math(node, ctx, "", "");
+                } else {
+                    // Regular paragraph text with inline styling and wrapping
+                    let spans = collect_inline_spans(node);
+                    // Collect links with a placeholder line number (will be fixed up after wrapping)
+                    let link_start = ctx.link_refs.len();
+                    collect_inline_elements(node, 0, &mut ctx.images, &mut ctx.link_refs);
 
-                let base_line = ctx.lines.len();
-                let wrapped = wrap_spans(&spans, ctx.wrap_width, "", "");
-                for line_spans in wrapped {
-                    let content = spans_to_string(&line_spans);
-                    ctx.lines.push(RenderedLine::with_spans(
-                        content,
-                        LineType::Paragraph,
-                        line_spans,
-                    ));
+                    let base_line = ctx.lines.len();
+                    let wrapped = wrap_spans(&spans, ctx.wrap_width, "", "");
+                    for line_spans in wrapped {
+                        let content = spans_to_string(&line_spans);
+                        ctx.lines.push(RenderedLine::with_spans(
+                            content,
+                            LineType::Paragraph,
+                            line_spans,
+                        ));
+                    }
+
+                    // Fix up link line numbers: find which wrapped line contains each link's text
+                    let extra = fixup_link_lines(
+                        &mut ctx.link_refs[link_start..],
+                        &ctx.lines[base_line..],
+                        base_line,
+                        0,
+                    );
+                    ctx.link_refs.extend(extra);
                 }
-
-                // Fix up link line numbers: find which wrapped line contains each link's text
-                let extra = fixup_link_lines(
-                    &mut ctx.link_refs[link_start..],
-                    &ctx.lines[base_line..],
-                    base_line,
-                    0,
-                );
-                ctx.link_refs.extend(extra);
             } else {
                 for (alt, src) in child_images {
                     let height_lines = ctx.image_heights.get(&src).copied().unwrap_or(1).max(1);
@@ -384,6 +478,25 @@ fn process_node<'a, S: BuildHasher>(
                     // Skip the normal code block rendering below.
                     return;
                 }
+            }
+
+            // Render ```math code blocks as math (image or text)
+            if language == Some("math") {
+                let trimmed_source = literal.trim_end().to_string();
+                let source_failed = ctx.failed_math_srcs.contains(&trimmed_source);
+                if ctx.math_as_images && !source_failed {
+                    emit_math_image_placeholder(&trimmed_source, ctx);
+                } else {
+                    emit_math_text_block(&trimmed_source, ctx);
+                }
+                // Store in math_sources even for text fallback
+                if !ctx.math_sources.values().any(|v| v == &trimmed_source) {
+                    let key = format!("math://{}", ctx.math_sources.len());
+                    ctx.math_sources.insert(key, trimmed_source);
+                }
+                ctx.lines
+                    .push(RenderedLine::new(String::new(), LineType::Empty));
+                return;
             }
 
             // Render CSV code blocks as tables instead of code blocks
@@ -538,36 +651,78 @@ fn process_node<'a, S: BuildHasher>(
             for child in node.children() {
                 match &child.data.borrow().value {
                     NodeValue::Paragraph | NodeValue::TaskItem(_) => {
+                        // Check for display math ($$...$$) inside list paragraphs
+                        if let Some(literal) = extract_display_math_literal(child) {
+                            // Render any text before the math as a list item line
+                            if let Some(spans) = collect_spans_before_display_math(child) {
+                                let prefix = if rendered_any {
+                                    &prefix_next
+                                } else {
+                                    &prefix_first
+                                };
+                                let wrapped =
+                                    wrap_spans(&spans, ctx.wrap_width, prefix, &prefix_next);
+                                for line_spans in wrapped {
+                                    let content = spans_to_string(&line_spans);
+                                    ctx.lines.push(RenderedLine::with_spans(
+                                        content,
+                                        LineType::ListItem(depth),
+                                        line_spans,
+                                    ));
+                                }
+                            }
+                            // Emit the display math block
+                            let source_failed = ctx.failed_math_srcs.contains(&literal);
+                            if ctx.math_as_images && !source_failed {
+                                emit_math_image_placeholder(&literal, ctx);
+                            } else {
+                                emit_math_text_block(&literal, ctx);
+                            }
+                            if !ctx.math_sources.values().any(|v| v == literal.trim_end()) {
+                                let key = format!("math://{}", ctx.math_sources.len());
+                                ctx.math_sources.insert(key, literal.trim_end().to_string());
+                            }
+                            ctx.lines
+                                .push(RenderedLine::new(String::new(), LineType::Empty));
+                            rendered_any = true;
+                            rendered_paragraphs += 1;
+                            continue;
+                        }
+
                         if rendered_paragraphs > 0 {
                             ctx.lines
                                 .push(RenderedLine::new(String::new(), LineType::ListItem(depth)));
                         }
-                        let spans = collect_inline_spans(child);
-                        let link_start = ctx.link_refs.len();
-                        collect_inline_elements(child, 0, &mut ctx.images, &mut ctx.link_refs);
                         let prefix = if rendered_any {
                             &prefix_next
                         } else {
                             &prefix_first
                         };
-                        let base_line = ctx.lines.len();
-                        let wrapped = wrap_spans(&spans, ctx.wrap_width, prefix, &prefix_next);
+                        if ctx.no_inline_math && ctx.math_as_images && has_inline_math(child) {
+                            emit_paragraph_with_no_inline_math(child, ctx, prefix, &prefix_next);
+                        } else {
+                            let spans = collect_inline_spans(child);
+                            let link_start = ctx.link_refs.len();
+                            collect_inline_elements(child, 0, &mut ctx.images, &mut ctx.link_refs);
+                            let base_line = ctx.lines.len();
+                            let wrapped = wrap_spans(&spans, ctx.wrap_width, prefix, &prefix_next);
 
-                        for line_spans in wrapped {
-                            let content = spans_to_string(&line_spans);
-                            ctx.lines.push(RenderedLine::with_spans(
-                                content,
-                                LineType::ListItem(depth),
-                                line_spans,
-                            ));
+                            for line_spans in wrapped {
+                                let content = spans_to_string(&line_spans);
+                                ctx.lines.push(RenderedLine::with_spans(
+                                    content,
+                                    LineType::ListItem(depth),
+                                    line_spans,
+                                ));
+                            }
+                            let extra = fixup_link_lines(
+                                &mut ctx.link_refs[link_start..],
+                                &ctx.lines[base_line..],
+                                base_line,
+                                prefix_next.len(),
+                            );
+                            ctx.link_refs.extend(extra);
                         }
-                        let extra = fixup_link_lines(
-                            &mut ctx.link_refs[link_start..],
-                            &ctx.lines[base_line..],
-                            base_line,
-                            prefix_next.len(),
-                        );
-                        ctx.link_refs.extend(extra);
                         rendered_any = true;
                         rendered_paragraphs += 1;
                     }
@@ -725,6 +880,258 @@ fn process_node<'a, S: BuildHasher>(
                 process_node(child, ctx, depth, list_marker.clone());
             }
         }
+    }
+}
+
+/// Extract a display math literal from a paragraph containing `$$...$$`.
+///
+/// Returns `Some(literal)` if the paragraph's **last** child (ignoring
+/// trailing soft/line breaks) is a display-math node.  This handles both
+/// the simple case (`$$math$$` alone) and paragraphs where text precedes
+/// the display block (e.g. after a hard line break `\`).
+/// Collect inline spans from children that precede a display math block.
+///
+/// Returns `None` if there is no non-whitespace text before the display math.
+fn collect_spans_before_display_math<'a>(node: &'a AstNode<'a>) -> Option<Vec<InlineSpan>> {
+    let has_leading_text = node.children().any(|c| {
+        let d = c.data.borrow();
+        !matches!(d.value, NodeValue::Math(ref m) if m.display_math)
+            && !matches!(d.value, NodeValue::SoftBreak | NodeValue::LineBreak)
+    });
+    if !has_leading_text {
+        return None;
+    }
+    let mut spans = Vec::new();
+    for child in node.children() {
+        let d = child.data.borrow();
+        if matches!(&d.value, NodeValue::Math(m) if m.display_math) {
+            break;
+        }
+        drop(d);
+        collect_inline_spans_recursive(child, InlineStyle::default(), &mut spans);
+    }
+    // Drop trailing whitespace spans
+    while spans.last().is_some_and(|s| s.text().trim().is_empty()) {
+        spans.pop();
+    }
+    if spans.is_empty() { None } else { Some(spans) }
+}
+
+fn extract_display_math_literal<'a>(node: &'a AstNode<'a>) -> Option<String> {
+    // Collect children so we can iterate in reverse.
+    let children: Vec<_> = node.children().collect();
+    for child in children.iter().rev() {
+        let data = child.data.borrow();
+        match &data.value {
+            NodeValue::Math(math) if math.display_math => {
+                return Some(math.literal.clone());
+            }
+            NodeValue::SoftBreak | NodeValue::LineBreak => {}
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// Emit a display math block as a framed text block with Unicode approximation.
+fn emit_math_text_block<S: BuildHasher>(literal: &str, ctx: &mut ParseContext<'_, S>) {
+    let unicode = crate::math::latex_to_unicode(literal);
+    let lines: Vec<&str> = unicode.lines().collect();
+    let max_width = lines
+        .iter()
+        .map(|l| unicode_width::UnicodeWidthStr::width(*l))
+        .max()
+        .unwrap_or(0);
+    let frame_width = max_width + 2; // 1 space padding on each side
+    let label = " math ";
+    let label_width = unicode_width::UnicodeWidthStr::width(label).min(frame_width);
+    let visible_label: String = label.chars().take(label_width).collect();
+    let top = format!(
+        "┌{}{}┐",
+        visible_label,
+        "─".repeat(
+            frame_width.saturating_sub(unicode_width::UnicodeWidthStr::width(
+                visible_label.as_str()
+            ))
+        )
+    );
+    ctx.lines.push(RenderedLine::new(top, LineType::Math));
+
+    for line in &lines {
+        let line_width = unicode_width::UnicodeWidthStr::width(*line);
+        let padding = " ".repeat(max_width.saturating_sub(line_width));
+        ctx.lines.push(RenderedLine::new(
+            format!("│ {line}{padding} │"),
+            LineType::Math,
+        ));
+    }
+
+    ctx.lines.push(RenderedLine::new(
+        format!("└{}┘", "─".repeat(frame_width)),
+        LineType::Math,
+    ));
+}
+
+/// Emit a display math block as an image placeholder (when images are supported).
+fn emit_math_image_placeholder<S: BuildHasher>(literal: &str, ctx: &mut ParseContext<'_, S>) {
+    let key = format!("math://{}", ctx.math_sources.len());
+    ctx.math_sources
+        .insert(key.clone(), literal.trim_end().to_string());
+
+    let height_lines = ctx.image_heights.get(&key).copied().unwrap_or(1).max(1);
+    let start_line = ctx.lines.len();
+    let label = "[Image: math equation]".to_string();
+
+    // No caption for math — "math equation" adds no useful info.
+    ctx.lines
+        .push(RenderedLine::new(label.clone(), LineType::Image));
+    ctx.link_refs.push(LinkRef {
+        text: label,
+        url: key.clone(),
+        line: start_line,
+    });
+
+    for _ in 1..height_lines {
+        ctx.lines
+            .push(RenderedLine::new(String::new(), LineType::Image));
+    }
+
+    let end_line = ctx.lines.len();
+    ctx.images.push(ImageRef {
+        alt: String::new(),
+        src: key,
+        line_range: start_line..end_line,
+    });
+}
+
+/// Check if a paragraph node contains any non-display inline math ($...$).
+fn has_inline_math<'a>(node: &'a AstNode<'a>) -> bool {
+    for child in node.children() {
+        let data = child.data.borrow();
+        if matches!(&data.value, NodeValue::Math(m) if !m.display_math) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Emit a paragraph, splitting at inline math boundaries so each `$...$`
+/// becomes its own image placeholder line.
+fn emit_paragraph_with_no_inline_math<'a, S: BuildHasher>(
+    node: &'a AstNode<'a>,
+    ctx: &mut ParseContext<'_, S>,
+    prefix_first: &str,
+    prefix_next: &str,
+) {
+    let line_type = if prefix_first.is_empty() {
+        LineType::Paragraph
+    } else {
+        // Infer depth from prefix indentation
+        let indent_chars = prefix_first.len() - prefix_first.trim_start().len();
+        let depth = (indent_chars / 2) + 1;
+        LineType::ListItem(depth)
+    };
+
+    // Collect links up-front so hyperlinks remain clickable even when
+    // the paragraph is split at inline-math boundaries.
+    let link_start = ctx.link_refs.len();
+    collect_inline_elements(node, 0, &mut ctx.images, &mut ctx.link_refs);
+    let base_line = ctx.lines.len();
+
+    let mut pending_spans: Vec<InlineSpan> = Vec::new();
+    let mut is_first_chunk = true;
+
+    for child in node.children() {
+        let data = child.data.borrow();
+        let math_literal = match &data.value {
+            NodeValue::Math(m) if !m.display_math => Some(m.literal.clone()),
+            _ => None,
+        };
+        drop(data);
+
+        if let Some(literal) = math_literal {
+            // Flush accumulated text spans as paragraph/list-item lines
+            flush_inline_spans(
+                &pending_spans,
+                ctx,
+                line_type,
+                is_first_chunk,
+                prefix_first,
+                prefix_next,
+            );
+            pending_spans.clear();
+            is_first_chunk = false;
+
+            // Emit this inline math as an image placeholder
+            if ctx.failed_math_srcs.contains(&literal) {
+                // Fallback: render as inline Unicode text
+                let text = crate::math::latex_to_unicode(&literal);
+                let math_style = InlineStyle {
+                    math: true,
+                    ..InlineStyle::default()
+                };
+                pending_spans.push(InlineSpan::new(text, math_style));
+            } else {
+                emit_math_image_placeholder(&literal, ctx);
+            }
+        } else {
+            // Accumulate non-math spans
+            collect_inline_spans_recursive(child, InlineStyle::default(), &mut pending_spans);
+        }
+    }
+
+    // Flush remaining text spans
+    flush_inline_spans(
+        &pending_spans,
+        ctx,
+        line_type,
+        is_first_chunk,
+        prefix_first,
+        prefix_next,
+    );
+
+    // Fix up link line numbers to match rendered output lines.
+    let prefix_len = prefix_next.len();
+    let extra = fixup_link_lines(
+        &mut ctx.link_refs[link_start..],
+        &ctx.lines[base_line..],
+        base_line,
+        prefix_len,
+    );
+    ctx.link_refs.extend(extra);
+}
+
+/// Flush accumulated inline spans as wrapped paragraph or list-item lines.
+fn flush_inline_spans<S: BuildHasher>(
+    spans: &[InlineSpan],
+    ctx: &mut ParseContext<'_, S>,
+    line_type: LineType,
+    is_first: bool,
+    prefix_first: &str,
+    prefix_next: &str,
+) {
+    if spans.is_empty() {
+        return;
+    }
+    // Drop leading/trailing whitespace-only spans
+    let start = spans
+        .iter()
+        .position(|s| !s.text().trim().is_empty())
+        .unwrap_or(spans.len());
+    let end = spans
+        .iter()
+        .rposition(|s| !s.text().trim().is_empty())
+        .map_or(0, |i| i + 1);
+    let trimmed = &spans[start..end];
+    if trimmed.is_empty() {
+        return;
+    }
+    let prefix = if is_first { prefix_first } else { prefix_next };
+    let wrapped = wrap_spans(trimmed, ctx.wrap_width, prefix, prefix_next);
+    for line_spans in wrapped {
+        let content = spans_to_string(&line_spans);
+        ctx.lines
+            .push(RenderedLine::with_spans(content, line_type, line_spans));
     }
 }
 
@@ -1316,6 +1723,12 @@ fn collect_inline_spans_recursive<'a>(
                 style,
             ));
         }
+        NodeValue::Math(math) => {
+            let mut math_style = style;
+            math_style.math = true;
+            let text = crate::math::latex_to_unicode(&math.literal);
+            spans.push(InlineSpan::new(text, math_style));
+        }
         NodeValue::SoftBreak | NodeValue::LineBreak => {
             spans.push(InlineSpan::new(" ".to_string(), style));
         }
@@ -1369,6 +1782,9 @@ fn extract_text_recursive<'a>(node: &'a AstNode<'a>, text: &mut String) {
         }
         NodeValue::FootnoteReference(reference) => {
             text.push_str(&render_footnote_reference(&reference.name));
+        }
+        NodeValue::Math(math) => {
+            text.push_str(&crate::math::latex_to_unicode(&math.literal));
         }
         NodeValue::SoftBreak | NodeValue::LineBreak => {
             text.push('\n');
@@ -2709,9 +3125,17 @@ mod tests {
         let mermaid_source = "graph TD\n    A --> B";
         let mut failed = HashSet::new();
         failed.insert(mermaid_source.to_string());
-        let doc =
-            Document::parse_with_all_options_and_failures(md, 80, &HashMap::new(), true, &failed)
-                .unwrap();
+        let doc = Document::parse_with_all_options_and_failures(
+            md,
+            80,
+            &HashMap::new(),
+            &DiagramRenderOpts {
+                mermaid_as_images: true,
+                failed_mermaid_srcs: &failed,
+                ..DiagramRenderOpts::default()
+            },
+        )
+        .unwrap();
         // Should NOT have an image placeholder
         assert!(doc.images().is_empty());
         // Should render as code block lines
@@ -2725,9 +3149,17 @@ mod tests {
     fn test_mermaid_block_renders_as_image_when_not_in_failed_set() {
         let md = "```mermaid\ngraph TD\n    A --> B\n```";
         let failed = HashSet::new(); // empty set
-        let doc =
-            Document::parse_with_all_options_and_failures(md, 80, &HashMap::new(), true, &failed)
-                .unwrap();
+        let doc = Document::parse_with_all_options_and_failures(
+            md,
+            80,
+            &HashMap::new(),
+            &DiagramRenderOpts {
+                mermaid_as_images: true,
+                failed_mermaid_srcs: &failed,
+                ..DiagramRenderOpts::default()
+            },
+        )
+        .unwrap();
         // Should have an image placeholder
         assert_eq!(doc.images().len(), 1);
         assert!(doc.images()[0].src.starts_with("mermaid://"));
@@ -3216,6 +3648,320 @@ mod tests {
             image_lines[0]
                 .content()
                 .contains("Emacs-rust-eglot-markdown.png")
+        );
+    }
+
+    // --- Math tests ---
+
+    #[test]
+    fn test_inline_math_produces_styled_span() {
+        let md = "The value $x^2$ is positive.";
+        let doc = Document::parse(md).unwrap();
+        let lines = doc.visible_lines(0, 20);
+        // Should find a span with math: true
+        let has_math_span = lines.iter().any(|l| {
+            l.spans()
+                .is_some_and(|spans| spans.iter().any(|s| s.style().math))
+        });
+        assert!(
+            has_math_span,
+            "inline $x^2$ should produce a math-styled span"
+        );
+    }
+
+    #[test]
+    fn test_inline_math_unicode_conversion() {
+        let md = r"The value $\alpha$ is greek.";
+        let doc = Document::parse(md).unwrap();
+        let lines = doc.visible_lines(0, 20);
+        let text: String = lines.iter().map(|l| l.content().to_string()).collect();
+        assert!(
+            text.contains('α'),
+            "inline \\alpha should be converted to Unicode α, got: {text}"
+        );
+    }
+
+    #[test]
+    fn test_display_math_renders_as_image_when_flag_set() {
+        let md = "$$E = mc^2$$";
+        let doc = Document::parse_with_all_options_and_failures(
+            md,
+            80,
+            &HashMap::new(),
+            &DiagramRenderOpts {
+                math_as_images: true,
+                ..DiagramRenderOpts::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            !doc.images().is_empty(),
+            "display math with math_as_images=true should produce ImageRef"
+        );
+        assert!(doc.images()[0].src.starts_with("math://"));
+    }
+
+    #[test]
+    fn test_display_math_renders_as_text_block_without_flag() {
+        let md = "$$E = mc^2$$";
+        let doc = Document::parse(md).unwrap();
+        let lines = doc.visible_lines(0, 20);
+        let has_math_line = lines.iter().any(|l| *l.line_type() == LineType::Math);
+        assert!(
+            has_math_line,
+            "display math without flag should produce LineType::Math lines"
+        );
+    }
+
+    #[test]
+    fn test_math_code_fence_as_image() {
+        let md = "```math\nE = mc^2\n```";
+        let doc = Document::parse_with_all_options_and_failures(
+            md,
+            80,
+            &HashMap::new(),
+            &DiagramRenderOpts {
+                math_as_images: true,
+                ..DiagramRenderOpts::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            !doc.images().is_empty(),
+            "```math with flag should produce ImageRef"
+        );
+        assert!(doc.images()[0].src.starts_with("math://"));
+    }
+
+    #[test]
+    fn test_math_code_fence_as_text() {
+        let md = "```math\nE = mc^2\n```";
+        let doc = Document::parse(md).unwrap();
+        let lines = doc.visible_lines(0, 20);
+        let has_math_line = lines.iter().any(|l| *l.line_type() == LineType::Math);
+        assert!(
+            has_math_line,
+            "```math without flag should produce LineType::Math lines"
+        );
+    }
+
+    #[test]
+    fn test_math_code_inline() {
+        // $`x^2`$ is "code math" syntax
+        let md = "The value $`x^2`$ is positive.";
+        let doc = Document::parse(md).unwrap();
+        let lines = doc.visible_lines(0, 20);
+        let has_math_span = lines.iter().any(|l| {
+            l.spans()
+                .is_some_and(|spans| spans.iter().any(|s| s.style().math))
+        });
+        assert!(
+            has_math_span,
+            "code math $`x^2`$ should produce a math-styled span"
+        );
+    }
+
+    #[test]
+    fn test_math_in_heading_text_extraction() {
+        let md = "# Title $x$";
+        let doc = Document::parse(md).unwrap();
+        let headings = doc.headings();
+        assert!(!headings.is_empty());
+        assert!(
+            headings[0].text.contains('x'),
+            "heading text should include math content"
+        );
+    }
+
+    #[test]
+    fn test_math_source_stored() {
+        let md = "$$E = mc^2$$";
+        let doc = Document::parse_with_all_options_and_failures(
+            md,
+            80,
+            &HashMap::new(),
+            &DiagramRenderOpts {
+                math_as_images: true,
+                ..DiagramRenderOpts::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            !doc.math_sources().is_empty(),
+            "math_sources should have an entry for display math"
+        );
+    }
+
+    #[test]
+    fn test_math_falls_back_when_in_failed_set() {
+        let md = "$$E = mc^2$$";
+        let mut failed = HashSet::new();
+        failed.insert("E = mc^2".to_string());
+        let doc = Document::parse_with_all_options_and_failures(
+            md,
+            80,
+            &HashMap::new(),
+            &DiagramRenderOpts {
+                math_as_images: true,
+                failed_math_srcs: &failed,
+                ..DiagramRenderOpts::default()
+            },
+        )
+        .unwrap();
+        // Should NOT have an image placeholder since source is in failed set
+        assert!(
+            doc.images().is_empty(),
+            "failed math source should not produce ImageRef"
+        );
+        // Should still have LineType::Math text block
+        let lines = doc.visible_lines(0, 20);
+        let has_math_line = lines.iter().any(|l| *l.line_type() == LineType::Math);
+        assert!(
+            has_math_line,
+            "failed math should fall through to text block"
+        );
+    }
+
+    #[test]
+    fn test_inline_math_as_image_splits_paragraph() {
+        // Paragraph with inline math should split into text + image + text
+        let md = "Before $x^2$ after.";
+        let doc = Document::parse_with_all_options_and_failures(
+            md,
+            80,
+            &HashMap::new(),
+            &DiagramRenderOpts {
+                math_as_images: true,
+                no_inline_math: true,
+                ..DiagramRenderOpts::default()
+            },
+        )
+        .unwrap();
+        // Should have an image placeholder for the inline math
+        assert!(
+            !doc.images().is_empty(),
+            "inline math with no_inline_math=true should produce ImageRef"
+        );
+        assert!(doc.images()[0].src.starts_with("math://"));
+        // Should have paragraph lines for text before and after the math
+        let lines = doc.visible_lines(0, 20);
+        let para_lines: Vec<_> = lines
+            .iter()
+            .filter(|l| *l.line_type() == LineType::Paragraph)
+            .collect();
+        assert!(
+            para_lines.len() >= 2,
+            "should have paragraph lines for text before and after math, got {}",
+            para_lines.len()
+        );
+    }
+
+    #[test]
+    fn test_inline_math_as_image_disabled_uses_unicode() {
+        // With no_inline_math=false, inline math should remain as Unicode text
+        let md = r"The value $\alpha$ is greek.";
+        let doc = Document::parse_with_all_options_and_failures(
+            md,
+            80,
+            &HashMap::new(),
+            &DiagramRenderOpts {
+                math_as_images: true,
+                ..DiagramRenderOpts::default()
+            },
+        )
+        .unwrap();
+        // Should NOT have any image placeholders
+        assert!(
+            doc.images().is_empty(),
+            "inline math with no_inline_math=false should not produce ImageRef"
+        );
+        // Should have inline Unicode text
+        let lines = doc.visible_lines(0, 20);
+        let text: String = lines.iter().map(|l| l.content().to_string()).collect();
+        assert!(
+            text.contains('α'),
+            "inline math should be Unicode text when no_inline_math=false, got: {text}"
+        );
+    }
+
+    #[test]
+    fn test_inline_math_as_image_in_list() {
+        let md = "- Item with $x^2$ math";
+        let doc = Document::parse_with_all_options_and_failures(
+            md,
+            80,
+            &HashMap::new(),
+            &DiagramRenderOpts {
+                math_as_images: true,
+                no_inline_math: true,
+                ..DiagramRenderOpts::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            !doc.images().is_empty(),
+            "inline math in list item with no_inline_math=true should produce ImageRef"
+        );
+        assert!(doc.images()[0].src.starts_with("math://"));
+    }
+
+    #[test]
+    fn test_inline_math_multiple_in_paragraph() {
+        let md = "First $a$ then $b$ last.";
+        let doc = Document::parse_with_all_options_and_failures(
+            md,
+            80,
+            &HashMap::new(),
+            &DiagramRenderOpts {
+                math_as_images: true,
+                no_inline_math: true,
+                ..DiagramRenderOpts::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            doc.images().len(),
+            2,
+            "two inline math expressions should produce two ImageRefs, got {}",
+            doc.images().len()
+        );
+        assert!(doc.images()[0].src.starts_with("math://"));
+        assert!(doc.images()[1].src.starts_with("math://"));
+    }
+
+    #[test]
+    fn test_inline_math_as_image_preserves_links() {
+        // Hyperlinks in paragraphs with inline math must remain clickable.
+        let md = "See [the paper](https://example.com) for proof that $x^2 > 0$.";
+        let doc = Document::parse_with_all_options_and_failures(
+            md,
+            80,
+            &HashMap::new(),
+            &DiagramRenderOpts {
+                math_as_images: true,
+                no_inline_math: true,
+                ..DiagramRenderOpts::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            !doc.links().is_empty(),
+            "links in paragraph with inline math should be collected"
+        );
+        assert_eq!(doc.links()[0].url, "https://example.com");
+    }
+
+    #[test]
+    fn test_inline_math_before_display_math_counts_as_leading_text() {
+        // Inline math $x$ before display math $$y$$ should be treated as
+        // leading text, not silently dropped.
+        let md = "$x$ then\n\n$$y$$";
+        let doc = Document::parse_with_layout(md, 80).unwrap();
+        let lines = doc.visible_lines(0, 20);
+        let has_x = lines.iter().any(|l| l.content().contains('x'));
+        assert!(
+            has_x,
+            "inline math $x$ before display math should be visible"
         );
     }
 }

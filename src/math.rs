@@ -21,11 +21,7 @@ use image::DynamicImage;
 /// (e.g. `\frac{a}{b}` → `(a)/(b)`, `\sqrt{x}` → `√(x)`).
 pub fn latex_to_unicode(latex: &str) -> String {
     let preprocessed = preprocess_for_unicode(latex);
-    // unicodeit can panic on certain inputs due to a TryFromIntError in its
-    // subscript/superscript expansion (naive_replace.rs:61).  Fall back to
-    // the preprocessed text rather than crashing the TUI.
-    let text = catch_unwind(AssertUnwindSafe(|| unicodeit::replace(&preprocessed)))
-        .unwrap_or_else(|_| preprocessed.clone());
+    let text = replace_unicodeit_groups(&preprocessed);
     simplify_remaining_commands(&text)
 }
 
@@ -65,6 +61,79 @@ fn preprocess_for_unicode(latex: &str) -> String {
     }
 
     result
+}
+
+/// Run `unicodeit` on grouped-script chunks separately to avoid its
+/// multi-match expansion panic while preserving conversion behavior.
+fn replace_unicodeit_groups(latex: &str) -> String {
+    let mut result = String::with_capacity(latex.len());
+    let mut cursor = 0;
+
+    while let Some((start, end)) = next_grouped_script_range(latex, cursor) {
+        if let Some(prefix) = latex.get(cursor..start) {
+            result.push_str(&replace_unicodeit_chunk(prefix));
+        }
+        if let Some(group) = latex.get(start..end) {
+            result.push_str(&replace_unicodeit_chunk(group));
+        }
+        cursor = end;
+    }
+
+    if let Some(tail) = latex.get(cursor..) {
+        result.push_str(&replace_unicodeit_chunk(tail));
+    }
+
+    result
+}
+
+/// Convert a single chunk of LaTeX via `unicodeit`, falling back to the
+/// original text if `unicodeit` panics on malformed input.
+fn replace_unicodeit_chunk(chunk: &str) -> String {
+    catch_unwind(AssertUnwindSafe(|| unicodeit::replace(chunk)))
+        .unwrap_or_else(|_| chunk.to_string())
+}
+
+/// Find the next `^{...}` or `_{...}` group in `latex` starting from byte
+/// offset `start`. Returns the byte range `(script_start, closing_brace+1)`.
+fn next_grouped_script_range(latex: &str, start: usize) -> Option<(usize, usize)> {
+    for (offset, ch) in latex.get(start..)?.char_indices() {
+        if !matches!(ch, '^' | '_') {
+            continue;
+        }
+
+        let script_start = start + offset;
+        let brace_start = script_start + ch.len_utf8();
+        if !latex.get(brace_start..)?.starts_with('{') {
+            continue;
+        }
+
+        if let Some(script_end) = find_matching_brace(latex, brace_start) {
+            return Some((script_start, script_end));
+        }
+    }
+
+    None
+}
+
+/// Return the byte position just past the `}` that matches the `{` at
+/// `open_brace`, respecting nested braces. Returns `None` if unbalanced.
+fn find_matching_brace(text: &str, open_brace: usize) -> Option<usize> {
+    let mut depth = 0usize;
+
+    for (offset, ch) in text.get(open_brace..)?.char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(open_brace + offset + ch.len_utf8());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    None
 }
 
 /// Replace all occurrences of `\cmd{content}` with just `content`.
@@ -718,6 +787,29 @@ mod tests {
     }
 
     #[test]
+    fn test_latex_to_unicode_multiple_grouped_superscripts() {
+        let result = latex_to_unicode("x^{ab} + y^{cd}");
+        assert_eq!(result, "xᵃᵇ + yᶜᵈ");
+    }
+
+    #[test]
+    fn test_latex_to_unicode_multiple_grouped_subscripts() {
+        let result = latex_to_unicode("a_{12} + b_{34}");
+        assert_eq!(result, "a₁₂ + b₃₄");
+    }
+
+    #[test]
+    fn test_latex_to_unicode_adjacent_grouped_scripts() {
+        // Superscript immediately followed by subscript — must not panic
+        // and both groups should be processed independently.
+        let result = latex_to_unicode("x^{2}_{1}");
+        assert!(
+            result.contains('²') && result.contains('₁'),
+            "expected superscript 2 and subscript 1, got: {result}"
+        );
+    }
+
+    #[test]
     fn test_latex_to_unicode_passthrough() {
         // Unknown commands should pass through
         let result = latex_to_unicode("hello world");
@@ -819,10 +911,21 @@ mod tests {
 
     #[test]
     fn test_latex_to_unicode_does_not_panic_on_bad_input() {
-        // unicodeit can panic with TryFromIntError on certain inputs.
-        // catch_unwind should prevent this from crashing the process.
-        let _result = latex_to_unicode("}}}{{{\\invalid\\command");
-        let _result = latex_to_unicode("x_{\\text{very deeply {nested}}}^{\\frac{a}{b}}");
+        // unicodeit can panic with TryFromIntError on certain inputs
+        // (e.g. deeply nested subscripts or exotic characters).
+        // latex_to_unicode must never panic — it should fall back gracefully.
+        let adversarial = [
+            "}}}{{{\\invalid\\command",
+            "^{^{^{^{^{^{}}}}}}",
+            "_{_{_{_{_{_{}}}}}}",
+            "\u{0300}\u{0301}\u{0302}^2",
+            "\\frac{\\frac{\\frac{a}{b}}{c}}{d}^{2^{3^{4}}}",
+            "x_{\\text{very deeply {nested}}}^{\\frac{a}{b}}",
+        ];
+        for input in &adversarial {
+            // Must not panic — any return value is acceptable
+            let _ = latex_to_unicode(input);
+        }
     }
 
     #[test]
